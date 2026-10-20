@@ -508,7 +508,7 @@ where
     ///   [`crate::qmdb::chain`] for more details).
     /// - [`Error::FloorRegressed`] if any commit in the chain declares a floor below the
     ///   previous commit's floor.
-    /// - [`Error::FloorBeyondSize`] if any commit in the chain declares a floor beyond its own
+    /// - [`Error::FloorBeyondCommit`] if any commit in the chain declares a floor beyond its own
     ///   commit location.
     #[tracing::instrument(name = "qmdb.keyless.compact.db.apply_batch", level = "info", skip_all)]
     pub async fn apply_batch(
@@ -3005,7 +3005,7 @@ mod tests {
 
             assert!(matches!(
                 db.apply_batch(batch).await,
-                Err(Error::FloorBeyondSize(floor, tip))
+                Err(Error::FloorBeyondCommit(floor, tip))
                     if floor == Location::new(2) && tip == Location::new(1)
             ));
         });
@@ -3036,7 +3036,7 @@ mod tests {
 
             assert!(matches!(
                 db.apply_batch(child).await,
-                Err(Error::FloorBeyondSize(floor, commit))
+                Err(Error::FloorBeyondCommit(floor, commit))
                     if floor == Location::new(3) && commit == Location::new(2)
             ));
         });

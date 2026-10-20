@@ -222,7 +222,10 @@ pub(crate) fn validate_commit_floors<F: Family, D: Digest>(
             return Err(Error::FloorRegressed(ancestor.floor, prev_floor));
         }
         if ancestor.floor > ancestor_commit_loc {
-            return Err(Error::FloorBeyondSize(ancestor.floor, ancestor_commit_loc));
+            return Err(Error::FloorBeyondCommit(
+                ancestor.floor,
+                ancestor_commit_loc,
+            ));
         }
         prev_floor = ancestor.floor;
     }
@@ -231,7 +234,7 @@ pub(crate) fn validate_commit_floors<F: Family, D: Digest>(
         return Err(Error::FloorRegressed(tip_floor, prev_floor));
     }
     if tip_floor > tip_commit_loc {
-        return Err(Error::FloorBeyondSize(tip_floor, tip_commit_loc));
+        return Err(Error::FloorBeyondCommit(tip_floor, tip_commit_loc));
     }
     Ok(())
 }
@@ -407,7 +410,7 @@ mod tests {
         let result = validate_commit_floors::<F, D>(loc(2), loc(1), &ancestors, loc(9), loc(9));
         assert!(matches!(
             result,
-            Err(Error::FloorBeyondSize(floor, commit)) if floor == loc(8) && commit == loc(6)
+            Err(Error::FloorBeyondCommit(floor, commit)) if floor == loc(8) && commit == loc(6)
         ));
     }
 
@@ -427,7 +430,7 @@ mod tests {
         let result = validate_commit_floors::<F, D>(loc(2), loc(1), &ancestors, loc(10), loc(9));
         assert!(matches!(
             result,
-            Err(Error::FloorBeyondSize(floor, commit)) if floor == loc(10) && commit == loc(9)
+            Err(Error::FloorBeyondCommit(floor, commit)) if floor == loc(10) && commit == loc(9)
         ));
     }
 }

@@ -670,7 +670,7 @@ where
     ///   unapplied ancestor) declares an inactivity floor below the previous
     ///   commit's floor (or, for the oldest unapplied commit, below the
     ///   database's current floor).
-    /// - [`Error::FloorBeyondSize`] if any commit in the chain (the tip or any
+    /// - [`Error::FloorBeyondCommit`] if any commit in the chain (the tip or any
     ///   unapplied ancestor) declares an inactivity floor that exceeds its
     ///   own commit operation's location. The maximum valid floor for a
     ///   commit is its own location; a floor past the commit would permit
@@ -3345,8 +3345,10 @@ pub(super) mod tests {
             .await
             .unwrap();
         let result = db.apply_batch(merkleized).await;
-        assert!(matches!(result, Err(Error::FloorBeyondSize(floor, commit))
-                if floor == Location::new(100) && commit == Location::new(2)));
+        assert!(
+            matches!(result, Err(Error::FloorBeyondCommit(floor, commit))
+                if floor == Location::new(100) && commit == Location::new(2))
+        );
 
         let db = open_db(context.child("test")).await;
 
@@ -3362,8 +3364,10 @@ pub(super) mod tests {
             .await
             .unwrap();
         let result = db.apply_batch(merkleized).await;
-        assert!(matches!(result, Err(Error::FloorBeyondSize(floor, commit))
-                if floor == Location::new(3) && commit == Location::new(2)));
+        assert!(
+            matches!(result, Err(Error::FloorBeyondCommit(floor, commit))
+                if floor == Location::new(3) && commit == Location::new(2))
+        );
 
         // Floor == total_size - 1 (the commit location) is the maximum valid.
         let db = open_db(context.child("test")).await;
@@ -3484,7 +3488,7 @@ pub(super) mod tests {
         };
         // The error must identify the ancestor's commit_loc (2), not the tip's (4).
         assert!(
-            matches!(err, Error::FloorBeyondSize(floor, commit)
+            matches!(err, Error::FloorBeyondCommit(floor, commit)
                 if floor == Location::new(3) && commit == Location::new(2)),
             "unexpected error: {err:?}"
         );

@@ -517,7 +517,7 @@ where
     ///    point). A floor past the commit would let a later `prune(floor)` remove the last
     ///    readable commit from the journal.
     ///
-    /// Violations return [`Error::FloorRegressed`] or [`Error::FloorBeyondSize`] identifying
+    /// Violations return [`Error::FloorRegressed`] or [`Error::FloorBeyondCommit`] identifying
     /// the offending floor and the bound it crossed (the prior validated floor, or the commit
     /// location, respectively). Floor validation happens before any journal mutation, so on floor
     /// errors the on-disk state is unchanged and reopening recovers the database as it was.
@@ -2943,7 +2943,7 @@ pub(crate) mod tests {
             panic!("expected apply_batch to fail");
         };
         assert!(
-            matches!(err, Error::FloorBeyondSize(floor, commit) if *floor == 999 && *commit == 3),
+            matches!(err, Error::FloorBeyondCommit(floor, commit) if *floor == 999 && *commit == 3),
             "unexpected error: {err:?}"
         );
 
@@ -2965,7 +2965,7 @@ pub(crate) mod tests {
             panic!("expected apply_batch to fail");
         };
         assert!(
-            matches!(err, Error::FloorBeyondSize(floor, commit) if *floor == 4 && *commit == 3),
+            matches!(err, Error::FloorBeyondCommit(floor, commit) if *floor == 4 && *commit == 3),
             "unexpected error: {err:?}"
         );
     }
@@ -3241,7 +3241,7 @@ pub(crate) mod tests {
         };
         // Error should identify the ancestor's commit_loc (2), not the tip's.
         assert!(
-            matches!(err, Error::FloorBeyondSize(floor, commit) if *floor == 3 && *commit == 2),
+            matches!(err, Error::FloorBeyondCommit(floor, commit) if *floor == 3 && *commit == 2),
             "unexpected error: {err:?}"
         );
     }

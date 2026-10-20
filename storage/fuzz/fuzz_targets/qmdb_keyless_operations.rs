@@ -33,7 +33,7 @@ enum BadFloorExpect {
 fn assert_bad_floor_error<F: Family>(err: &Error<F>, kind: BadFloorExpect) {
     match (err, kind) {
         (Error::FloorRegressed(_, _), BadFloorExpect::Regression) => {}
-        (Error::FloorBeyondSize(_, _), BadFloorExpect::BeyondSize) => {}
+        (Error::FloorBeyondCommit(_, _), BadFloorExpect::BeyondSize) => {}
         _ => panic!("unexpected error for {kind:?}: {err:?}"),
     }
 }
@@ -49,7 +49,7 @@ enum FloorKind {
     AdvanceToCommit,
     /// Floor one below the current floor. It must be rejected as `FloorRegressed`.
     BadRegression,
-    /// Floor one past the commit location. It must be rejected as `FloorBeyondSize`.
+    /// Floor one past the commit location. It must be rejected as `FloorBeyondCommit`.
     BadBeyondCommit,
 }
 
