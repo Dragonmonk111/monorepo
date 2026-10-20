@@ -1023,7 +1023,9 @@ impl<B: Blob, Phase> Writer<B, Phase> {
     /// Read multiple fixed-size items at sorted byte offsets into a contiguous caller buffer.
     ///
     /// `buf` must be exactly `offsets.len() * item_size` bytes. All offsets must be sorted,
-    /// non-overlapping, and within bounds.
+    /// non-overlapping, and within bounds. Pages read from the blob enter the page cache unless
+    /// `options` contains [`ReadOptions::DONT_ADMIT`], which suits bulk scans of items that will
+    /// not be read again soon.
     ///
     /// Returns the number of items fully served without a blob read (from the in-memory tail and the
     /// page cache). The remaining items required at least one blob read.
@@ -1032,23 +1034,10 @@ impl<B: Blob, Phase> Writer<B, Phase> {
         buf: &mut [u8],
         offsets: &[u64],
         item_size: NonZeroUsize,
+        options: ReadOptions,
     ) -> Result<usize, Error> {
         self.view()
-            .read_many_into(buf, offsets, item_size, true)
-            .await
-    }
-
-    /// Like [`Self::read_many_into`], but cache misses read from the blob without admitting
-    /// pages into the page cache. Suited to bulk scans of items that will not be read again
-    /// soon.
-    pub async fn read_many_into_uncached(
-        &self,
-        buf: &mut [u8],
-        offsets: &[u64],
-        item_size: NonZeroUsize,
-    ) -> Result<usize, Error> {
-        self.view()
-            .read_many_into(buf, offsets, item_size, false)
+            .read_many_into(buf, offsets, item_size, options)
             .await
     }
 
@@ -2056,7 +2045,7 @@ mod tests {
             // Empty offsets should succeed immediately.
             let mut buf = [];
             append
-                .read_many_into(&mut buf, &[], NZUsize!(4))
+                .read_many_into(&mut buf, &[], NZUsize!(4), ReadOptions::default())
                 .await
                 .unwrap();
         });
@@ -2081,7 +2070,7 @@ mod tests {
             let offsets = [0u64, 4, 8, 12, 16];
             let mut buf = vec![0u8; 5 * 4];
             append
-                .read_many_into(&mut buf, &offsets, NZUsize!(4))
+                .read_many_into(&mut buf, &offsets, NZUsize!(4), ReadOptions::default())
                 .await
                 .unwrap();
 
@@ -2163,7 +2152,7 @@ mod tests {
             let offsets = [0u64, 8, 16];
             let mut buf = vec![0u8; 3 * 4];
             append
-                .read_many_into(&mut buf, &offsets, NZUsize!(4))
+                .read_many_into(&mut buf, &offsets, NZUsize!(4), ReadOptions::default())
                 .await
                 .unwrap();
 
@@ -2199,7 +2188,7 @@ mod tests {
             let offsets = [0u64, 4, 16, 24];
             let mut buf = vec![0u8; 4 * 4];
             append
-                .read_many_into(&mut buf, &offsets, NZUsize!(4))
+                .read_many_into(&mut buf, &offsets, NZUsize!(4), ReadOptions::default())
                 .await
                 .unwrap();
 
@@ -2229,7 +2218,7 @@ mod tests {
             // Last offset's end (8 + 4 = 12) exceeds size (8).
             let mut buf = vec![0u8; 4];
             let err = append
-                .read_many_into(&mut buf, &[8], NZUsize!(4))
+                .read_many_into(&mut buf, &[8], NZUsize!(4), ReadOptions::default())
                 .await
                 .unwrap_err();
             assert!(matches!(err, Error::BlobInsufficientLength));
@@ -2252,7 +2241,7 @@ mod tests {
 
             let mut buf = vec![0u8; 8];
             append
-                .read_many_into(&mut buf, &[0], NZUsize!(8))
+                .read_many_into(&mut buf, &[0], NZUsize!(8), ReadOptions::default())
                 .await
                 .unwrap();
             assert_eq!(&buf, &data);
@@ -2275,7 +2264,9 @@ mod tests {
 
             let offsets = [0u64, 4];
             let mut buf = vec![0u8; 7];
-            let _ = append.read_many_into(&mut buf, &offsets, NZUsize!(4)).await;
+            let _ = append
+                .read_many_into(&mut buf, &offsets, NZUsize!(4), ReadOptions::default())
+                .await;
         });
     }
 
@@ -2294,7 +2285,9 @@ mod tests {
             (append, _) = append.append(&data).await.unwrap();
 
             let mut buf = vec![0u8; 8];
-            let _ = append.read_many_into(&mut buf, &[8, 4], NZUsize!(4)).await;
+            let _ = append
+                .read_many_into(&mut buf, &[8, 4], NZUsize!(4), ReadOptions::default())
+                .await;
         });
     }
 
@@ -2313,7 +2306,9 @@ mod tests {
             (append, _) = append.append(&data).await.unwrap();
 
             let mut buf = vec![0u8; 8];
-            let _ = append.read_many_into(&mut buf, &[2, 4], NZUsize!(4)).await;
+            let _ = append
+                .read_many_into(&mut buf, &[2, 4], NZUsize!(4), ReadOptions::default())
+                .await;
         });
     }
 
@@ -2332,7 +2327,12 @@ mod tests {
 
             let mut buf = vec![0u8; 8];
             let err = append
-                .read_many_into(&mut buf, &[u64::MAX - 1, 4], NZUsize!(4))
+                .read_many_into(
+                    &mut buf,
+                    &[u64::MAX - 1, 4],
+                    NZUsize!(4),
+                    ReadOptions::default(),
+                )
                 .await
                 .unwrap_err();
             assert!(matches!(err, Error::OffsetOverflow));
@@ -2364,7 +2364,12 @@ mod tests {
             let offsets: Vec<u64> = (0..35).map(|i| i * item_size as u64).collect();
             let mut batch_buf = vec![0u8; offsets.len() * item_size];
             append
-                .read_many_into(&mut batch_buf, &offsets, NZUsize!(item_size))
+                .read_many_into(
+                    &mut batch_buf,
+                    &offsets,
+                    NZUsize!(item_size),
+                    ReadOptions::default(),
+                )
                 .await
                 .unwrap();
 
@@ -2430,7 +2435,12 @@ mod tests {
             ];
             let mut buf = vec![0u8; offsets.len() * item_size];
             append
-                .read_many_into(&mut buf, &offsets, NZUsize!(item_size))
+                .read_many_into(
+                    &mut buf,
+                    &offsets,
+                    NZUsize!(item_size),
+                    ReadOptions::default(),
+                )
                 .await
                 .unwrap();
 
@@ -2485,7 +2495,12 @@ mod tests {
             let offsets = [straddle_off, tip_off];
             let mut buf = vec![0u8; offsets.len() * item_size];
             let hits = append
-                .read_many_into(&mut buf, &offsets, NZUsize!(item_size))
+                .read_many_into(
+                    &mut buf,
+                    &offsets,
+                    NZUsize!(item_size),
+                    ReadOptions::default(),
+                )
                 .await
                 .unwrap();
 
@@ -5686,7 +5701,12 @@ mod tests {
             ];
             let mut batch = vec![0u8; offsets.len() * item_size];
             snapshot
-                .read_many_into(&mut batch, &offsets, NZUsize!(item_size))
+                .read_many_into(
+                    &mut batch,
+                    &offsets,
+                    NZUsize!(item_size),
+                    ReadOptions::default(),
+                )
                 .await
                 .unwrap();
 

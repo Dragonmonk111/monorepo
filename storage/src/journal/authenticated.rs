@@ -475,7 +475,10 @@ where
             .await?;
 
         let positions: Vec<u64> = (*start_loc..*end_loc).collect();
-        let ops = self.journal.read_many(&positions).await?;
+        let ops = self
+            .journal
+            .read_many(&positions, ReadOptions::default())
+            .await?;
 
         Ok((proof, ops))
     }
@@ -490,6 +493,7 @@ where
     pub(crate) async fn read_many_sharded(
         &self,
         positions: &[u64],
+        options: ReadOptions,
     ) -> Result<Vec<Vec<C::Item>>, JournalError> {
         // An empty batch cannot shard: the parallel arm's chunk math needs a non-zero chunk
         // size, and the policy may explore that arm at any batch size.
@@ -545,7 +549,7 @@ where
         if misses.is_empty() {
             return Ok(shards.into_iter().map(|(hits, _)| hits).collect());
         }
-        let mut fetched = journal.read_many(&misses).await?.into_iter();
+        let mut fetched = journal.read_many(&misses, options).await?.into_iter();
 
         // Weave the fetched items back into each shard that declined positions.
         let mut result = Vec::with_capacity(shards.len());
@@ -665,7 +669,9 @@ where
             while merkle_leaves < journal_size {
                 let count = apply_batch_size.get().min(journal_size - *merkle_leaves);
                 let positions: Vec<u64> = (*merkle_leaves..*merkle_leaves + count).collect();
-                let items = journal.read_many(&positions).await?;
+                let items = journal
+                    .read_many(&positions, ReadOptions::default())
+                    .await?;
                 merkle_leaves += count;
 
                 let batch = merkle.new_batch().add_many(hasher, &items);
@@ -1022,8 +1028,12 @@ where
         self.journal.read(position).await
     }
 
-    async fn read_many(&self, positions: &[u64]) -> Result<Vec<C::Item>, JournalError> {
-        let mut shards = self.read_many_sharded(positions).await?;
+    async fn read_many(
+        &self,
+        positions: &[u64],
+        options: ReadOptions,
+    ) -> Result<Vec<C::Item>, JournalError> {
+        let mut shards = self.read_many_sharded(positions, options).await?;
         if shards.len() == 1 {
             return Ok(shards.pop().expect("length checked"));
         }
@@ -1559,7 +1569,9 @@ mod tests {
             let journal = journal.sync().await.unwrap();
 
             let positions: Vec<u64> = (0..count).collect();
-            let batch = Contiguous::read_many(&journal, &positions).await.unwrap();
+            let batch = Contiguous::read_many(&journal, &positions, ReadOptions::default())
+                .await
+                .unwrap();
             assert_eq!(batch.len(), positions.len());
             for &pos in &positions {
                 let single = Contiguous::read(&journal, pos).await.unwrap();
@@ -1568,7 +1580,7 @@ mod tests {
 
             // An empty batch is a no-op, even with a multi-threaded strategy.
             assert!(
-                Contiguous::read_many(&journal, &[])
+                Contiguous::read_many(&journal, &[], ReadOptions::default())
                     .await
                     .unwrap()
                     .is_empty()
@@ -1588,7 +1600,7 @@ mod tests {
             }
             let journal = journal.sync().await.unwrap();
 
-            let _ = Contiguous::read_many(&journal, &[1, 0]).await;
+            let _ = Contiguous::read_many(&journal, &[1, 0], ReadOptions::default()).await;
         });
     }
 

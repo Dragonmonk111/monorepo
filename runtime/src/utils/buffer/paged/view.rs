@@ -7,7 +7,7 @@
 //! exactly one place.
 
 use super::{CacheRef, tip::Buffer};
-use crate::{Blob, Error, IoBufMut, IoBufs};
+use crate::{Blob, Error, IoBufMut, IoBufs, ReadOptions};
 use commonware_utils::Widen;
 use std::{num::NonZeroUsize, sync::Arc};
 
@@ -244,8 +244,10 @@ impl<B: Blob> View<'_, B> {
     /// Read multiple fixed-size items at sorted byte offsets into a contiguous caller buffer.
     ///
     /// `buf` must be exactly `offsets.len() * item_size` bytes. All offsets must be sorted,
-    /// non-overlapping, and within bounds. Pages read from the blob enter the page cache only
-    /// when `admit` is set.
+    /// non-overlapping, and within bounds. Pages read from the blob enter the page cache unless
+    /// `options` contains [`ReadOptions::DONT_ADMIT`]. No other option applies: missing pages
+    /// are read with [`ReadOptions::DONT_CACHE`], since the page cache retains the pages it
+    /// admits and callers skip admission only for pages they will not read again soon.
     ///
     /// Returns the number of items fully served without a blob read (from the in-memory tail and
     /// the page cache). The remaining items required at least one blob read.
@@ -254,7 +256,7 @@ impl<B: Blob> View<'_, B> {
         buf: &mut [u8],
         offsets: &[u64],
         item_size: NonZeroUsize,
-        admit: bool,
+        options: ReadOptions,
     ) -> Result<usize, Error> {
         let ranges = || offsets.iter().map(|&o| (o, item_size.get()));
         super::validate_read_ranges(buf.len(), ranges(), self.size)?;
@@ -272,6 +274,7 @@ impl<B: Blob> View<'_, B> {
         }
 
         // Read the pages the misses need and serve the misses from them.
+        let admit = !options.contains(ReadOptions::DONT_ADMIT);
         self.cache_ref
             .read_after_misses(self.blob, self.id, cache_ranges, admit)
             .await?;
@@ -398,7 +401,7 @@ fn map_misses(
 #[cfg(test)]
 mod tests {
     use super::map_misses;
-    use crate::{Runner as _, Storage as _, buffer::paged::Writer, deterministic};
+    use crate::{ReadOptions, Runner as _, Storage as _, buffer::paged::Writer, deterministic};
     use commonware_utils::{NZU16, NZUsize};
     use std::num::NonZeroU16;
 
@@ -479,7 +482,7 @@ mod tests {
             // Evict persisted pages to exercise asynchronous cache-miss reads.
             cache.clear();
             writer
-                .read_many_into(&mut batch, &offsets, NZUsize!(17))
+                .read_many_into(&mut batch, &offsets, NZUsize!(17), ReadOptions::default())
                 .await
                 .unwrap();
             assert_eq!(batch, expected);

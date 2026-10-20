@@ -578,33 +578,21 @@ impl<'a, B: RBlob> Blob<'a, B> {
         Ok(Replay::paged(replay))
     }
 
-    /// Read fixed-size items at sorted byte offsets into `buf`.
+    /// Read fixed-size items at sorted byte offsets into `buf`, with `options` applied to the
+    /// pages read from the blob.
     pub(super) async fn read_many_into(
         &self,
         buf: &mut [u8],
         offsets: &[u64],
         item_size: NonZeroUsize,
-    ) -> Result<usize, Error> {
-        match self {
-            Self::Writer(writer) => Ok(writer.read_many_into(buf, offsets, item_size).await?),
-            Self::Sealed(sealed) => Ok(sealed.read_many_into(buf, offsets, item_size).await?),
-        }
-    }
-
-    /// Like [`Self::read_many_into`], but cache misses read from the blob without admitting pages
-    /// into the page cache.
-    pub(super) async fn read_many_into_uncached(
-        &self,
-        buf: &mut [u8],
-        offsets: &[u64],
-        item_size: NonZeroUsize,
+        options: ReadOptions,
     ) -> Result<usize, Error> {
         match self {
             Self::Writer(writer) => Ok(writer
-                .read_many_into_uncached(buf, offsets, item_size)
+                .read_many_into(buf, offsets, item_size, options)
                 .await?),
             Self::Sealed(sealed) => Ok(sealed
-                .read_many_into_uncached(buf, offsets, item_size)
+                .read_many_into(buf, offsets, item_size, options)
                 .await?),
         }
     }

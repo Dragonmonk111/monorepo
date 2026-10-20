@@ -1397,15 +1397,13 @@ mod tests {
             );
             let offsets: Vec<_> = (0..pages).map(|i| i * PAGE_SIZE_U64).collect();
             let mut out = vec![0; offsets.len() * 4];
-            let mut read = Box::pin(async {
-                if uncached {
-                    sealed
-                        .read_many_into_uncached(&mut out, &offsets, NZUsize!(4))
-                        .await
-                } else {
-                    sealed.read_many_into(&mut out, &offsets, NZUsize!(4)).await
-                }
-            });
+            let options = if uncached {
+                ReadOptions::DONT_ADMIT
+            } else {
+                ReadOptions::default()
+            };
+            let mut read =
+                Box::pin(sealed.read_many_into(&mut out, &offsets, NZUsize!(4), options));
             let result = commonware_macros::select! {
                 result = &mut read => Some(result),
                 _ = context.sleep(Duration::from_secs(1)) => None,
@@ -1964,7 +1962,7 @@ mod tests {
             let offsets: Vec<u64> = (0..10).map(|page| page * PAGE_SIZE_U64).collect();
             let mut buf = vec![0u8; offsets.len()];
             let served = view
-                .read_many_into(&mut buf, &offsets, NZUsize!(1), true)
+                .read_many_into(&mut buf, &offsets, NZUsize!(1), ReadOptions::default())
                 .await
                 .unwrap();
             assert_eq!(served, 0);
@@ -2001,7 +1999,12 @@ mod tests {
             };
             let mut buf = vec![0u8; size as usize];
             let served = view
-                .read_many_into(&mut buf, &[0], NZUsize!(size as usize), true)
+                .read_many_into(
+                    &mut buf,
+                    &[0],
+                    NZUsize!(size as usize),
+                    ReadOptions::default(),
+                )
                 .await
                 .unwrap();
             assert_eq!(served, 0);
@@ -2248,15 +2251,15 @@ mod tests {
         cache_ref: &CacheRef,
         pages: &[u64],
     ) -> Result<Vec<u8>, Error> {
-        read_first_bytes_admitting(blob, cache_ref, pages, true).await
+        read_first_bytes_with(blob, cache_ref, pages, ReadOptions::default()).await
     }
 
-    /// Like [read_first_bytes], admitting the pages read from the blob only when `admit` is set.
-    async fn read_first_bytes_admitting<B: Blob>(
+    /// Like [read_first_bytes], reading with `options`.
+    async fn read_first_bytes_with<B: Blob>(
         blob: &Arc<B>,
         cache_ref: &CacheRef,
         pages: &[u64],
-        admit: bool,
+        options: ReadOptions,
     ) -> Result<Vec<u8>, Error> {
         let size = pages.last().map_or(0, |last| (last + 1) * PAGE_SIZE_U64);
         let view = View {
@@ -2269,7 +2272,7 @@ mod tests {
         };
         let offsets: Vec<u64> = pages.iter().map(|page| page * PAGE_SIZE_U64).collect();
         let mut buf = vec![0u8; pages.len()];
-        view.read_many_into(&mut buf, &offsets, NZUsize!(1), admit)
+        view.read_many_into(&mut buf, &offsets, NZUsize!(1), options)
             .await?;
         Ok(buf)
     }
@@ -2380,7 +2383,8 @@ mod tests {
             // A read without admission of those pages joins neither, reading every page again
             // with a batch it does not register. Only a page's first read waits at its gate, so
             // the read completes while the others still wait.
-            let read = read_first_bytes_admitting(&blob, &cache_ref, &[0, 1, 2], false);
+            let read =
+                read_first_bytes_with(&blob, &cache_ref, &[0, 1, 2], ReadOptions::DONT_ADMIT);
             assert_eq!(read.await.unwrap(), [0, 1, 2]);
             for page in 0..3 {
                 assert_eq!(blob.reads_of(page), 2);
@@ -2403,11 +2407,11 @@ mod tests {
 
             // A read without admission of pages 3 to 5 starts first, waits at their gates, and
             // registers no batch.
-            let mut bypass = pin!(read_first_bytes_admitting(
+            let mut bypass = pin!(read_first_bytes_with(
                 &blob,
                 &cache_ref,
                 &[3, 4, 5],
-                false
+                ReadOptions::DONT_ADMIT
             ));
             assert!(poll!(bypass.as_mut()).is_pending());
             assert!(cache_ref.cache.read().batches.by_blob.is_empty());
@@ -3465,7 +3469,7 @@ mod tests {
             };
             let offsets: Vec<u64> = (1..40).map(|page| page * PAGE_SIZE_U64 - 2).collect();
             let mut buf = vec![0u8; offsets.len() * 4];
-            view.read_many_into(&mut buf, &offsets, NZUsize!(4), true)
+            view.read_many_into(&mut buf, &offsets, NZUsize!(4), ReadOptions::default())
                 .await
                 .unwrap();
             let expected: Vec<u8> = offsets

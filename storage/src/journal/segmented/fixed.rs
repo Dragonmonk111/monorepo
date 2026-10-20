@@ -442,7 +442,12 @@ impl<E: Storage + Metrics, A: CodecFixedShared> Inner<E, A> {
         }
 
         let hits = blob
-            .read_many_into(buf, &offsets, NZUsize!(Self::CHUNK_SIZE))
+            .read_many_into(
+                buf,
+                &offsets,
+                NZUsize!(Self::CHUNK_SIZE),
+                ReadOptions::default(),
+            )
             .await?;
 
         let mut items = Vec::with_capacity(positions.len());

@@ -50,6 +50,7 @@ use ahash::AHashMap;
 use bytes::BufMut;
 use commonware_codec::{Buf, Encode, EncodeSize, Read, ReadExt as _, Write, varint::UInt};
 use commonware_cryptography::{Digest, Hasher};
+use commonware_runtime::ReadOptions;
 use commonware_utils::bitmap::{Prunable as BitMap, Readable as BitmapReadable};
 use core::{num::NonZeroU64, ops::Range};
 use tracing::debug;
@@ -371,7 +372,7 @@ impl<F: Graftable, D: Digest> RangeProof<F, D> {
 
         // Collect the operations necessary to verify the proof.
         let positions: Vec<u64> = (*request.start_loc..*end_loc).collect();
-        let ops = log.read_many(&positions).await?;
+        let ops = log.read_many(&positions, ReadOptions::default()).await?;
 
         // Gather the chunks necessary to verify the proof.
         let end = (*end_loc - 1) / chunk_bits; // chunk that contains the last bit

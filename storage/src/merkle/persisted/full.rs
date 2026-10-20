@@ -33,7 +33,7 @@ use crate::{
 use commonware_codec::{Copying, DecodeExt, Write};
 use commonware_cryptography::Digest;
 use commonware_parallel::Strategy;
-use commonware_runtime::{Handle, buffer::paged::CacheRef};
+use commonware_runtime::{Handle, ReadOptions, buffer::paged::CacheRef};
 use commonware_utils::{range::NonEmptyRange, sequence::prefixed_u64::U64};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -651,7 +651,7 @@ impl<F: Family, E: Context, D: Digest, S: Strategy> Merkle<F, E, D, S> {
     /// Returns [`Error::ElementPruned`] for the first of `positions` that falls below the
     /// journal's pruning boundary.
     pub async fn get_nodes(&self, positions: &[Position<F>]) -> Result<Vec<D>, Error<F>> {
-        self.get_nodes_with_admission(positions, true).await
+        self.get_nodes_with(positions, ReadOptions::default()).await
     }
 
     /// A read-only view that uses resident pages but does not admit pages on cache misses.
@@ -662,10 +662,11 @@ impl<F: Family, E: Context, D: Digest, S: Strategy> Merkle<F, E, D, S> {
         Uncached(self)
     }
 
-    async fn get_nodes_with_admission(
+    /// [`Self::get_nodes`] with `options` applied to the journal reads.
+    async fn get_nodes_with(
         &self,
         positions: &[Position<F>],
-        admit: bool,
+        options: ReadOptions,
     ) -> Result<Vec<D>, Error<F>> {
         assert!(
             positions.is_sorted_by(|a, b| a < b),
@@ -690,12 +691,10 @@ impl<F: Family, E: Context, D: Digest, S: Strategy> Merkle<F, E, D, S> {
         let items = if journal_positions.is_empty() {
             Vec::new()
         } else {
-            if admit {
-                self.journal.read_many(&journal_positions).await
-            } else {
-                self.journal.read_many_uncached(&journal_positions).await
-            }
-            .map_err(Error::Journal)?
+            self.journal
+                .read_many(&journal_positions, options)
+                .await
+                .map_err(Error::Journal)?
         };
 
         // The unfilled slots are exactly the journal subsequence, in the order it was built.
@@ -1118,7 +1117,11 @@ impl<F: Family, E: Context, D: Digest, S: Strategy> crate::merkle::storage::Stor
     }
 
     async fn get_node(&self, position: Position<F>) -> Result<Option<D>, Error<F>> {
-        match self.0.get_nodes_with_admission(&[position], false).await {
+        match self
+            .0
+            .get_nodes_with(&[position], ReadOptions::DONT_ADMIT)
+            .await
+        {
             Ok(nodes) => Ok(Some(nodes[0])),
             Err(Error::ElementPruned(_)) => Ok(None),
             Err(error) => Err(error),
@@ -1126,7 +1129,9 @@ impl<F: Family, E: Context, D: Digest, S: Strategy> crate::merkle::storage::Stor
     }
 
     async fn get_nodes(&self, positions: &[Position<F>]) -> Result<Vec<D>, Error<F>> {
-        self.0.get_nodes_with_admission(positions, false).await
+        self.0
+            .get_nodes_with(positions, ReadOptions::DONT_ADMIT)
+            .await
     }
 }
 

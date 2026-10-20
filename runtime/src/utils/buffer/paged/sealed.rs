@@ -142,7 +142,9 @@ impl<B: Blob> Sealed<B> {
     /// Read multiple fixed-size items at sorted byte offsets into a contiguous caller buffer.
     ///
     /// `buf` must be exactly `offsets.len() * item_size` bytes. All offsets must be sorted,
-    /// non-overlapping, and within bounds.
+    /// non-overlapping, and within bounds. Pages read from the blob enter the page cache unless
+    /// `options` contains [`ReadOptions::DONT_ADMIT`], which suits bulk scans of items that will
+    /// not be read again soon.
     ///
     /// Returns the number of items fully served without a blob read (from the in-memory tail and the
     /// page cache). The remaining items required at least one blob read.
@@ -151,23 +153,10 @@ impl<B: Blob> Sealed<B> {
         buf: &mut [u8],
         offsets: &[u64],
         item_size: NonZeroUsize,
+        options: ReadOptions,
     ) -> Result<usize, Error> {
         self.view()
-            .read_many_into(buf, offsets, item_size, true)
-            .await
-    }
-
-    /// Like [`Self::read_many_into`], but cache misses read from the blob without admitting
-    /// pages into the page cache. Suited to bulk scans of items that will not be read again
-    /// soon.
-    pub async fn read_many_into_uncached(
-        &self,
-        buf: &mut [u8],
-        offsets: &[u64],
-        item_size: NonZeroUsize,
-    ) -> Result<usize, Error> {
-        self.view()
-            .read_many_into(buf, offsets, item_size, false)
+            .read_many_into(buf, offsets, item_size, options)
             .await
     }
 
@@ -672,7 +661,12 @@ mod tests {
             let item_size = 4usize;
             let mut out = vec![0u8; offsets.len() * item_size];
             sealed
-                .read_many_into(&mut out, &offsets, NZUsize!(item_size))
+                .read_many_into(
+                    &mut out,
+                    &offsets,
+                    NZUsize!(item_size),
+                    ReadOptions::default(),
+                )
                 .await
                 .unwrap();
 
@@ -831,7 +825,12 @@ mod tests {
             let item_size = 4usize;
             let mut out = vec![0u8; offsets.len() * item_size];
             sealed
-                .read_many_into(&mut out, &offsets, NZUsize!(item_size))
+                .read_many_into(
+                    &mut out,
+                    &offsets,
+                    NZUsize!(item_size),
+                    ReadOptions::default(),
+                )
                 .await
                 .unwrap();
 
@@ -849,7 +848,7 @@ mod tests {
     /// Offsets cover same-page clusters (served by one page fetch each) and a range that
     /// crosses a page boundary.
     #[test_traced("DEBUG")]
-    fn test_sealed_read_many_into_uncached_leaves_cache_cold() {
+    fn test_sealed_read_many_into_without_admission_leaves_cache_cold() {
         let executor = deterministic::Runner::default();
         executor.start(|context: deterministic::Context| async move {
             let (blob, blob_size) = context.open("test_partition", b"rmany_cold").await.unwrap();
@@ -872,7 +871,12 @@ mod tests {
             let item_size = 4usize;
             let mut out = vec![0u8; offsets.len() * item_size];
             sealed
-                .read_many_into_uncached(&mut out, &offsets, NZUsize!(item_size))
+                .read_many_into(
+                    &mut out,
+                    &offsets,
+                    NZUsize!(item_size),
+                    ReadOptions::DONT_ADMIT,
+                )
                 .await
                 .unwrap();
             for (i, &off) in offsets.iter().enumerate() {
@@ -904,7 +908,9 @@ mod tests {
             sync.await.unwrap();
 
             let mut out = vec![0u8; 8];
-            let _ = sealed.read_many_into(&mut out, &[8, 4], NZUsize!(4)).await;
+            let _ = sealed
+                .read_many_into(&mut out, &[8, 4], NZUsize!(4), ReadOptions::default())
+                .await;
         });
     }
 
@@ -924,13 +930,18 @@ mod tests {
 
             let mut out = vec![0u8; 8];
             let err = sealed
-                .read_many_into(&mut out, &[u64::MAX - 1, 8], NZUsize!(4))
+                .read_many_into(
+                    &mut out,
+                    &[u64::MAX - 1, 8],
+                    NZUsize!(4),
+                    ReadOptions::default(),
+                )
                 .await
                 .unwrap_err();
             assert!(matches!(err, Error::OffsetOverflow));
 
             let err = sealed
-                .read_many_into(&mut out, &[28, 32], NZUsize!(4))
+                .read_many_into(&mut out, &[28, 32], NZUsize!(4), ReadOptions::default())
                 .await
                 .unwrap_err();
             assert!(matches!(err, Error::BlobInsufficientLength));
