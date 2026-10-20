@@ -55,7 +55,9 @@
 //!
 //! # Traits
 //!
-//! Keyed mutable variants ([any] and [current]) implement `any::traits::DbAny`.
+//! The `test-traits` feature compiles `any::traits`, whose `DbAny` and `Provable` traits give the
+//! crate's tests and benchmarks one interface over the keyed mutable variants ([any] and
+//! [current]). Without the feature, each variant exposes only its inherent methods.
 //!
 //! # Acknowledgments
 //!
