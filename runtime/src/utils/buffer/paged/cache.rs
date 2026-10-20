@@ -170,11 +170,14 @@ struct Batch {
     blob_id: u64,
     /// The page numbers, strictly increasing. A page's index in this list identifies it.
     pages: Box<[u64]>,
+    /// Whether published pages enter the page cache. A batch that does not admit is never
+    /// registered, so its starter is its only reader.
+    admit: bool,
     state: Mutex<BatchState>,
 }
 
 impl Batch {
-    fn new(blob_id: u64, pages: Vec<u64>) -> Self {
+    fn new(blob_id: u64, pages: Vec<u64>, admit: bool) -> Self {
         let state = BatchState {
             joiners: vec![Some(Vec::new()); pages.len()].into(),
             inboxes: vec![Some(VecDeque::new())],
@@ -183,6 +186,7 @@ impl Batch {
         Self {
             blob_id,
             pages: pages.into(),
+            admit,
             state: Mutex::new(state),
         }
     }
@@ -191,18 +195,19 @@ impl Batch {
     /// as it arrives. A page failing validation is published as failed while the others continue.
     /// A read error, or a read that does not yield every page exactly once, fails the batch.
     ///
-    /// The future owns `_retire` from its creation, so the batch retires once the future ends or
-    /// is dropped, polled or not.
+    /// The future owns `_retire` from its creation, so a registered batch retires once the future
+    /// ends or is dropped, polled or not.
     async fn read<B: Blob>(
         self: Arc<Self>,
         cache: Arc<RwLock<Cache>>,
         blob: Arc<B>,
         physical: Vec<(u64, usize)>,
         page_size: NonZeroU16,
-        _retire: RetireGuard,
+        _retire: Option<RetireGuard>,
     ) -> Result<(), Error> {
         let result = async {
-            // CacheRef retains the pages, so the source pages need not remain in the OS page
+            // The page cache retains admitted pages, and callers bypass admission only for pages
+            // they will not read again soon, so the source pages need not remain in the OS page
             // cache.
             let mut stream = pin!(blob.read_many(&physical, ReadOptions::DONT_CACHE));
             while let Some((index, bufs)) = stream.try_next().await? {
@@ -227,15 +232,18 @@ impl Batch {
         result
     }
 
-    /// Publish the outcome of the page at `index`. Caches the page if it is valid and delivers it
-    /// to the starter and the page's joiners. Fails if the page was already published.
+    /// Publish the outcome of the page at `index`. Caches the page if it is valid and the batch
+    /// admits, and delivers it to the starter and the page's joiners. Fails if the page was
+    /// already published.
     fn publish(
         &self,
         cache: &RwLock<Cache>,
         index: usize,
         result: Result<IoBuf, Error>,
     ) -> Result<(), Error> {
-        let mut cache = cache.write();
+        // Only a registered batch, which admits, needs the cache lock: it keeps readers from
+        // selecting a page as it is published, and caches the page.
+        let mut cache = self.admit.then(|| cache.write());
         let mut state = self.state.lock();
         let BatchState {
             joiners, inboxes, ..
@@ -243,7 +251,7 @@ impl Batch {
         let Some(joiners) = joiners[index].take() else {
             return Err(Error::ReadFailed);
         };
-        if let Ok(page) = &result {
+        if let (Some(cache), Ok(page)) = (&mut cache, &result) {
             cache.cache(self.blob_id, page.as_ref(), self.pages[index]);
         }
         drop(cache);
@@ -791,19 +799,23 @@ impl CacheRef {
     /// Complete the unread suffixes a [Self::read_cached_many] probe left in `ranges` (each
     /// `(destination, logical offset)`, non-empty, in ascending offset order).
     ///
-    /// Each page the ranges touch is copied from the cache when resident, joined when another
-    /// reader is fetching it, alone or in a batch, and otherwise read with one batched blob read
-    /// that validates, caches, and serves each page as it arrives. Other readers that miss a page
-    /// of that batch join it. Serving never depends on the cache still holding a page, so no page
-    /// this call reads is read again to serve it. A page failing validation returns an error, like
-    /// a single fetch, as does a failed read of this call's own batch, or of a joined batch while
-    /// this call still awaits one of its pages. Pages cached before it remain, subject to normal
-    /// eviction.
+    /// Each page the ranges touch is copied from the cache when resident, joined when `admit` is
+    /// set and another reader is fetching it, alone or in a batch, and otherwise read with one
+    /// batched blob read that validates and serves each page as it arrives, caching it only when
+    /// `admit` is set. Other readers that miss a page of an admitting batch join it. A read
+    /// without admission neither joins nor is joined: a joined fetch caches its page when it
+    /// completes, even after every other reader of it cancels, and a joined batch would hand an
+    /// admitting reader a page that never reaches the cache. Serving never depends on the cache
+    /// still holding a page, so no page this call reads is read again to serve it. A page failing
+    /// validation returns an error, like a single fetch, as does a failed read of this call's own
+    /// batch, or of a joined batch while this call still awaits one of its pages. Pages cached
+    /// before it remain, subject to normal eviction.
     pub(super) async fn read_after_misses<B: Blob>(
         &self,
         blob: &Arc<B>,
         blob_id: u64,
         ranges: Vec<(&mut [u8], u64)>,
+        admit: bool,
     ) -> Result<(), Error> {
         // Split every range at page boundaries. Copy resident pieces now, before this call's own
         // insertions can evict their pages.
@@ -834,8 +846,8 @@ impl CacheRef {
         }
 
         // Join a source for every page before driving any. Copy pages that became resident, join
-        // the fetches and batches other readers have in flight, and read the rest with one batch
-        // of this call's own, registered so later readers join it.
+        // the fetches and batches other readers have in flight when admitting, and read the rest
+        // with one batch of this call's own, registered so later readers join it when admitting.
         let mut fetches = Vec::new();
         let mut reads: Vec<BatchRead<'_, '_>> = Vec::new();
         {
@@ -850,6 +862,8 @@ impl CacheRef {
                 let key = (blob_id, page_num);
                 if let Some(page) = cache.get_page(blob_id, page_num) {
                     copy_page(page.as_ref(), pieces);
+                } else if !admit {
+                    unread.push((physical, pieces));
                 } else if let Some(entry) = cache.page_fetches.get_mut(&key) {
                     entry.waiters += 1;
                     let fetch = PageFetchGuard::new(&self.cache, key, entry.fetch.clone());
@@ -872,8 +886,8 @@ impl CacheRef {
             if !unread.is_empty() {
                 let (physical, pieces): (Vec<_>, Vec<_>) = unread.into_iter().unzip();
                 let pages = pieces.iter().map(|pieces| pieces[0].0).collect();
-                let batch = Arc::new(Batch::new(blob_id, pages));
-                let retire = cache.batches.retire_on_drop(&batch);
+                let batch = Arc::new(Batch::new(blob_id, pages, admit));
+                let retire = admit.then(|| cache.batches.retire_on_drop(&batch));
                 let read = batch.clone().read(
                     self.cache.clone(),
                     blob.clone(),
@@ -882,7 +896,9 @@ impl CacheRef {
                     retire,
                 );
                 let driver = Shared::new(read.boxed());
-                cache.batches.register(&batch, &driver);
+                if admit {
+                    cache.batches.register(&batch, &driver);
+                }
                 reads.push(BatchRead::starting(batch, driver, pieces));
             }
         }
@@ -1158,8 +1174,8 @@ async fn fetch_cacheable_page(
     cacheable_page(page, page_num, page_size)
 }
 
-/// Return a validated page's logical bytes, rejecting partial pages because cache entries must
-/// always contain a full logical page.
+/// Return a validated page's logical bytes, rejecting partial pages because cache entries and
+/// batched reads both require a full logical page.
 fn cacheable_page(page: IoBuf, page_num: u64, page_size: NonZeroU16) -> Result<IoBuf, Error> {
     // We should never be fetching partial pages through the page cache. This can happen if a
     // non-last page is corrupted and falls back to a partial CRC.
@@ -1283,6 +1299,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     enum ControlledBlobResult {
         Success(Vec<u8>),
         Error,
@@ -1352,6 +1369,59 @@ mod tests {
         async fn start_sync(&self) -> Handle<()> {
             Handle::ready(self.sync().await)
         }
+    }
+
+    #[rstest]
+    #[case::cached(false)]
+    #[case::uncached(true)]
+    fn test_batch_reports_later_error(#[case] uncached: bool) {
+        deterministic::Runner::default().start(|context| async move {
+            let pages = 4u64;
+            let (started_tx, _started_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            let reads = Arc::new(AtomicUsize::new(0));
+            let blob = ControlledBlob {
+                started: Mutex::new(Some(started_tx)),
+                release: Mutex::new(Some(release_rx)),
+                reads: reads.clone(),
+                result: ControlledBlobResult::Error,
+            };
+            let cache = CacheRef::new(PAGE_SIZE, NZUsize!(1));
+            let id = cache.next_id();
+            let sealed = super::super::Sealed::new(
+                Arc::new(blob),
+                PAGE_SIZE_U64 * pages,
+                None,
+                cache.clone(),
+                id,
+            );
+            let offsets: Vec<_> = (0..pages).map(|i| i * PAGE_SIZE_U64).collect();
+            let mut out = vec![0; offsets.len() * 4];
+            let mut read = Box::pin(async {
+                if uncached {
+                    sealed
+                        .read_many_into_uncached(&mut out, &offsets, NZUsize!(4))
+                        .await
+                } else {
+                    sealed.read_many_into(&mut out, &offsets, NZUsize!(4)).await
+                }
+            });
+            let result = commonware_macros::select! {
+                result = &mut read => Some(result),
+                _ = context.sleep(Duration::from_secs(1)) => None,
+            };
+            assert!(reads.load(Ordering::Relaxed) >= 2);
+            assert!(cache.cache.read().page_fetches.is_empty());
+            assert!(
+                matches!(result, Some(Err(Error::ReadFailed))),
+                "completed page error hidden (uncached={uncached})"
+            );
+            assert!(
+                release_tx.send(()).is_err(),
+                "stalled read was not cancelled"
+            );
+            drop(read);
+        });
     }
 
     #[test_traced]
@@ -1776,7 +1846,7 @@ mod tests {
                 .map(|(buf, (offset, _))| (buf.as_mut_slice(), offset))
                 .collect();
             cache_ref
-                .read_after_misses(&blob, 0, pending)
+                .read_after_misses(&blob, 0, pending, true)
                 .await
                 .unwrap();
             assert_eq!(recordings.snapshot().reads.len(), 5);
@@ -1812,6 +1882,7 @@ mod tests {
                             3 * PAGE_SIZE_U64 + page as u64 - 1,
                         ),
                     ],
+                    true,
                 )
                 .await
                 .unwrap();
@@ -1840,7 +1911,7 @@ mod tests {
                 .map(|(buf, offset)| (buf.as_mut_slice(), offset))
                 .collect();
             assert!(matches!(
-                cache_ref.read_after_misses(&blob, 0, pending).await,
+                cache_ref.read_after_misses(&blob, 0, pending, true).await,
                 Err(Error::InvalidChecksum)
             ));
             let mut buf = [0u8; 1];
@@ -1854,7 +1925,7 @@ mod tests {
                 .map(|(buf, offset)| (buf.as_mut_slice(), offset))
                 .collect();
             cache_ref
-                .read_after_misses(&blob, 0, pending)
+                .read_after_misses(&blob, 0, pending, true)
                 .await
                 .unwrap();
             assert_eq!(bufs, [[0], [2]]);
@@ -1893,7 +1964,7 @@ mod tests {
             let offsets: Vec<u64> = (0..10).map(|page| page * PAGE_SIZE_U64).collect();
             let mut buf = vec![0u8; offsets.len()];
             let served = view
-                .read_many_into(&mut buf, &offsets, NZUsize!(1))
+                .read_many_into(&mut buf, &offsets, NZUsize!(1), true)
                 .await
                 .unwrap();
             assert_eq!(served, 0);
@@ -1930,7 +2001,7 @@ mod tests {
             };
             let mut buf = vec![0u8; size as usize];
             let served = view
-                .read_many_into(&mut buf, &[0], NZUsize!(size as usize))
+                .read_many_into(&mut buf, &[0], NZUsize!(size as usize), true)
                 .await
                 .unwrap();
             assert_eq!(served, 0);
@@ -2171,11 +2242,21 @@ mod tests {
     }
 
     /// Read the first byte of each of `pages` (ascending) of `blob` (cache id 0) with one batched
-    /// read.
+    /// read that admits the pages it reads from the blob.
     async fn read_first_bytes<B: Blob>(
         blob: &Arc<B>,
         cache_ref: &CacheRef,
         pages: &[u64],
+    ) -> Result<Vec<u8>, Error> {
+        read_first_bytes_admitting(blob, cache_ref, pages, true).await
+    }
+
+    /// Like [read_first_bytes], admitting the pages read from the blob only when `admit` is set.
+    async fn read_first_bytes_admitting<B: Blob>(
+        blob: &Arc<B>,
+        cache_ref: &CacheRef,
+        pages: &[u64],
+        admit: bool,
     ) -> Result<Vec<u8>, Error> {
         let size = pages.last().map_or(0, |last| (last + 1) * PAGE_SIZE_U64);
         let view = View {
@@ -2188,7 +2269,8 @@ mod tests {
         };
         let offsets: Vec<u64> = pages.iter().map(|page| page * PAGE_SIZE_U64).collect();
         let mut buf = vec![0u8; pages.len()];
-        view.read_many_into(&mut buf, &offsets, NZUsize!(1)).await?;
+        view.read_many_into(&mut buf, &offsets, NZUsize!(1), admit)
+            .await?;
         Ok(buf)
     }
 
@@ -2249,6 +2331,102 @@ mod tests {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    /// A page whose footer vouches for a shorter prefix (a damaged main CRC slot falling back to a
+    /// partial one) is an `InvalidChecksum` error, never a panic.
+    #[rstest]
+    #[case::admit(true)]
+    #[case::bypass(false)]
+    #[test_traced]
+    fn test_read_after_misses_rejects_short_page(#[case] admit: bool) {
+        let executor = deterministic::Runner::default();
+        executor.start(move |context| async move {
+            // Page 1 vouches for its first 100 bytes only.
+            let blob = checksummed_blob(&context, 2).await;
+            let mut page = vec![1u8; PAGE_SIZE.get() as usize];
+            let crc = Crc32::checksum(&page[..100]);
+            page.extend_from_slice(&Checksum::new(100, crc).to_bytes());
+            blob.write_at(PAGE_SIZE_U64 + CHECKSUM_SIZE, page, WriteOptions::default())
+                .await
+                .unwrap();
+            let cache_ref = CacheRef::new(PAGE_SIZE, NZUsize!(4));
+
+            let mut buf = [0u8; 8];
+            let pending = vec![(buf.as_mut_slice(), PAGE_SIZE_U64 + 200)];
+            assert!(matches!(
+                cache_ref.read_after_misses(&blob, 0, pending, admit).await,
+                Err(Error::InvalidChecksum)
+            ));
+        });
+    }
+
+    /// A read without admission neither joins the fetches and batches in flight nor is joined by
+    /// later readers, and leaves every page it reads out of the page cache.
+    #[test_traced]
+    fn test_read_after_misses_without_admission_neither_joins_nor_caches() {
+        let executor = deterministic::Runner::default();
+        executor.start(|_| async move {
+            const PAGES: u64 = 6;
+            let (blob, mut opens) = GatedBlob::new(PAGES as usize);
+            let cache_ref = CacheRef::new(PAGE_SIZE, NZUsize!(16));
+
+            // Other readers are fetching pages 0 to 2: page 0 alone and pages 1 and 2 in a batch.
+            let mut first = Box::pin(read_first_byte(&blob, &cache_ref, 0));
+            assert!(poll!(first.as_mut()).is_pending());
+            let mut rest = Box::pin(read_first_bytes(&blob, &cache_ref, &[1, 2]));
+            assert!(poll!(rest.as_mut()).is_pending());
+
+            // A read without admission of those pages joins neither, reading every page again
+            // with a batch it does not register. Only a page's first read waits at its gate, so
+            // the read completes while the others still wait.
+            let read = read_first_bytes_admitting(&blob, &cache_ref, &[0, 1, 2], false);
+            assert_eq!(read.await.unwrap(), [0, 1, 2]);
+            for page in 0..3 {
+                assert_eq!(blob.reads_of(page), 2);
+            }
+            assert_eq!(selected(&cache_ref), 0);
+            {
+                let cache = cache_ref.cache.read();
+                assert_eq!(cache.page_fetches[&(0, 0)].waiters, 1);
+                assert_eq!(cache.batches.by_blob[&0].len(), 1);
+            }
+
+            // Cancelling the other readers leaves every page uncached.
+            drop(first);
+            drop(rest);
+            assert_idle(&cache_ref);
+            let mut buf = [0u8; 1];
+            for page in 0..3 {
+                assert_eq!(cache_ref.read_cached(0, &mut buf, page * PAGE_SIZE_U64), 0);
+            }
+
+            // A read without admission of pages 3 to 5 starts first, waits at their gates, and
+            // registers no batch.
+            let mut bypass = pin!(read_first_bytes_admitting(
+                &blob,
+                &cache_ref,
+                &[3, 4, 5],
+                false
+            ));
+            assert!(poll!(bypass.as_mut()).is_pending());
+            assert!(cache_ref.cache.read().batches.by_blob.is_empty());
+
+            // Later readers of those pages have nothing to join, so each reads its pages again
+            // and caches them, while the earlier read serves itself from its own batch.
+            open(&mut opens);
+            assert_eq!(read_first_byte(&blob, &cache_ref, 3).await.unwrap(), 3);
+            assert_eq!(
+                read_first_bytes(&blob, &cache_ref, &[4, 5]).await.unwrap(),
+                [4, 5]
+            );
+            assert_eq!(bypass.await.unwrap(), [3, 4, 5]);
+            for page in 3..6 {
+                assert_eq!(blob.reads_of(page as usize), 2);
+                assert_eq!(cache_ref.read_cached(0, &mut buf, page * PAGE_SIZE_U64), 1);
+            }
+            assert_idle(&cache_ref);
+        });
     }
 
     #[test_traced]
@@ -3135,7 +3313,7 @@ mod tests {
             for (id, page) in started {
                 let mut buf = [0u8; 1];
                 let ranges = vec![(buf.as_mut_slice(), page * PAGE_SIZE_U64)];
-                let mut read = pin!(cache_ref.read_after_misses(&blob, id, ranges));
+                let mut read = pin!(cache_ref.read_after_misses(&blob, id, ranges, true));
                 assert!(poll!(read.as_mut()).is_pending());
             }
             assert_idle(&cache_ref);
@@ -3159,7 +3337,7 @@ mod tests {
 
             // A batch of page 0 outlives its driver, as when a read holding it already has its
             // pages but every handle on the driver is dropped.
-            let batch = Arc::new(Batch::new(0, vec![0]));
+            let batch = Arc::new(Batch::new(0, vec![0], true));
             let driver: BatchDriver = Shared::new(pending::<Result<(), Error>>().boxed());
             cache_ref.cache.write().batches.register(&batch, &driver);
             drop(driver);
@@ -3287,7 +3465,7 @@ mod tests {
             };
             let offsets: Vec<u64> = (1..40).map(|page| page * PAGE_SIZE_U64 - 2).collect();
             let mut buf = vec![0u8; offsets.len() * 4];
-            view.read_many_into(&mut buf, &offsets, NZUsize!(4))
+            view.read_many_into(&mut buf, &offsets, NZUsize!(4), true)
                 .await
                 .unwrap();
             let expected: Vec<u8> = offsets
