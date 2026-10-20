@@ -15,7 +15,7 @@
 //!
 //! # Database Lifecycle
 //!
-//! All variants are modified through a batch API that follows a common pattern:
+//! All authenticated variants are modified through a batch API that follows a common pattern:
 //! 1. Create a batch from the database.
 //! 2. Stage mutations on the batch.
 //! 3. Merkleize the batch -- this resolves mutations against the current state and computes
@@ -319,8 +319,7 @@ pub enum Error<F: Family> {
     #[error("initialization bound must allow at least one operation")]
     InvalidInitializationBound,
 
-    /// Persisted state failed a consistency check during initialization, recovery, or a sync
-    /// import. The payload names the check.
+    /// Database state failed a consistency check. The payload names the check.
     #[error("data corrupted: {0}")]
     DataCorrupted(&'static str),
 
@@ -352,8 +351,8 @@ pub enum Error<F: Family> {
     #[error("key exists")]
     KeyExists,
 
-    /// The operation at the location is not the kind required there: a snapshot location that
-    /// does not hold a set, or a sync result whose only operation is not the commit at its start.
+    /// A snapshot location does not hold a set, or a compact sync result is not exactly one
+    /// commit at the expected location. The payload is that location.
     #[error("unexpected data at location: {0}")]
     UnexpectedData(Location<F>),
 
@@ -378,7 +377,9 @@ pub enum Error<F: Family> {
     #[error("stale batch: current database state does not match the batch")]
     StaleBatch,
 
-    /// The batch's inactivity floor is lower than the database's current floor.
+    /// A commit's inactivity floor is below the floor before it: the database's current floor,
+    /// or the preceding commit's floor in a chain of batches. The payloads are the requested
+    /// floor and that earlier floor.
     #[error("floor regressed: batch floor {0} < current floor {1}")]
     FloorRegressed(Location<F>, Location<F>),
 
