@@ -314,7 +314,8 @@ impl<E: Context> Writable<E> {
         Blobs {
             oldest_blob_index: self.oldest_blob_index,
             sealed: SealedBlobs::Borrowed(&self.sealed),
-            tail: Blob::Writer(&self.tail),
+            tail: Blob::writer(&self.tail),
+            options: ReadOptions::default(),
         }
     }
 
@@ -336,7 +337,8 @@ impl<E: Context> Writable<E> {
         let blobs = Blobs {
             oldest_blob_index: self.oldest_blob_index,
             sealed: SealedBlobs::Owned(sealed),
-            tail: Blob::Sealed(snapshot),
+            tail: Blob::sealed(snapshot),
+            options: ReadOptions::default(),
         };
         Ok((self, blobs))
     }
@@ -476,6 +478,23 @@ pub(super) struct Blobs<'a, B: RBlob> {
     sealed: SealedBlobs<'a, B>,
     /// Tail blob.
     tail: Blob<'a, B>,
+    /// Options applied to every read through this view.
+    options: ReadOptions,
+}
+
+impl<B: RBlob> Clone for Blobs<'_, B> {
+    fn clone(&self) -> Self {
+        let sealed = match &self.sealed {
+            SealedBlobs::Borrowed(sealed) => SealedBlobs::Borrowed(sealed),
+            SealedBlobs::Owned(sealed) => SealedBlobs::Owned(sealed.clone()),
+        };
+        Self {
+            oldest_blob_index: self.oldest_blob_index,
+            sealed,
+            tail: self.tail.clone(),
+            options: self.options,
+        }
+    }
 }
 
 /// Storage for the sealed history slice.
@@ -496,9 +515,17 @@ impl<B: RBlob> SealedBlobs<'_, B> {
 }
 
 /// A read handle for one journal blob.
-pub(super) enum Blob<'a, B: RBlob> {
+pub(super) struct Blob<'a, B: RBlob> {
+    /// The blob's logical bytes.
+    source: Source<'a, B>,
+    /// Options applied to every read through this handle.
+    options: ReadOptions,
+}
+
+/// The logical bytes behind a [Blob].
+enum Source<'a, B: RBlob> {
     /// Writable tail. Point reads go through the writer's cache-aware logical view, and
-    /// [`Self::replay_from`] chooses the replay path.
+    /// [`Blob::replay_from`] chooses the replay path.
     Writer(&'a Writer<B>),
     /// Immutable historical blob.
     Sealed(Sealed<B>),
@@ -506,36 +533,56 @@ pub(super) enum Blob<'a, B: RBlob> {
 
 impl<B: RBlob> Clone for Blob<'_, B> {
     fn clone(&self) -> Self {
-        match self {
-            Self::Writer(writer) => Self::Writer(writer),
-            Self::Sealed(sealed) => Self::Sealed(sealed.clone()),
+        let source = match &self.source {
+            Source::Writer(writer) => Source::Writer(writer),
+            Source::Sealed(sealed) => Source::Sealed(sealed.clone()),
+        };
+        Self {
+            source,
+            options: self.options,
         }
     }
 }
 
 impl<'a, B: RBlob> Blob<'a, B> {
+    /// A handle on the writable tail whose reads apply no options.
+    pub(super) fn writer(writer: &'a Writer<B>) -> Self {
+        Self {
+            source: Source::Writer(writer),
+            options: ReadOptions::default(),
+        }
+    }
+
+    /// A handle on a sealed blob whose reads apply no options.
+    pub(super) fn sealed(sealed: Sealed<B>) -> Self {
+        Self {
+            source: Source::Sealed(sealed),
+            options: ReadOptions::default(),
+        }
+    }
+
     /// Return the blob's logical size.
     pub(super) fn size(&self) -> u64 {
-        match self {
-            Self::Writer(writer) => writer.size(),
-            Self::Sealed(sealed) => sealed.size(),
+        match &self.source {
+            Source::Writer(writer) => writer.size(),
+            Source::Sealed(sealed) => sealed.size(),
         }
     }
 
     /// Read into `buf` if the data is already cached.
     pub(super) fn try_read_sync_into(&self, buf: &mut [u8], offset: u64) -> bool {
-        match self {
-            Self::Writer(writer) => writer.try_read_sync_into(buf, offset),
-            Self::Sealed(sealed) => sealed.try_read_sync_into(buf, offset),
+        match &self.source {
+            Source::Writer(writer) => writer.try_read_sync_into(buf, offset),
+            Source::Sealed(sealed) => sealed.try_read_sync_into(buf, offset),
         }
     }
 
     /// Read exactly `len` bytes at `offset`.
     pub(super) async fn read_at(&self, offset: u64, len: usize) -> Result<IoBufs, Error> {
-        match self {
-            Self::Writer(writer) => Ok(writer.read_at(offset, len).await?),
-            Self::Sealed(sealed) => Ok(sealed.read_at(offset, len).await?),
-        }
+        Ok(match &self.source {
+            Source::Writer(writer) => writer.read_at(offset, len, self.options).await?,
+            Source::Sealed(sealed) => sealed.read_at(offset, len, self.options).await?,
+        })
     }
 
     /// Read up to `len` bytes at `offset`.
@@ -545,10 +592,10 @@ impl<'a, B: RBlob> Blob<'a, B> {
         len: usize,
         bufs: impl Into<IoBufMut> + Send,
     ) -> Result<(IoBufMut, usize), Error> {
-        match self {
-            Self::Writer(writer) => Ok(writer.read_up_to(offset, len, bufs).await?),
-            Self::Sealed(sealed) => Ok(sealed.read_up_to(offset, len, bufs).await?),
-        }
+        Ok(match &self.source {
+            Source::Writer(writer) => writer.read_up_to(offset, len, bufs, self.options).await?,
+            Source::Sealed(sealed) => sealed.read_up_to(offset, len, bufs, self.options).await?,
+        })
     }
 
     /// Return a sequential replay handle starting at `offset`.
@@ -566,20 +613,26 @@ impl<'a, B: RBlob> Blob<'a, B> {
         buffer_size: NonZeroUsize,
         read_options: ReadOptions,
     ) -> Result<Replay<'a, B>, Error> {
-        let sealed = match self {
-            Self::Writer(writer) => match writer.try_snapshot() {
+        let sealed = match self.source {
+            Source::Writer(writer) => match writer.try_snapshot() {
                 Some(snapshot) => snapshot,
-                None => return Replay::view(Self::Writer(writer), offset, buffer_size),
+                None => {
+                    let view = Self {
+                        source: Source::Writer(writer),
+                        options: self.options,
+                    };
+                    return Replay::view(view, offset, buffer_size);
+                }
             },
-            Self::Sealed(sealed) => sealed,
+            Source::Sealed(sealed) => sealed,
         };
         let mut replay = sealed.replay(buffer_size, read_options)?;
         replay.seek_to(offset)?;
         Ok(Replay::paged(replay))
     }
 
-    /// Read fixed-size items at sorted byte offsets into `buf`, with `options` applied to the
-    /// pages read from the blob.
+    /// Read fixed-size items at sorted byte offsets into `buf`, with `options` and the handle's
+    /// own options applied to the pages read from the blob.
     pub(super) async fn read_many_into(
         &self,
         buf: &mut [u8],
@@ -587,14 +640,19 @@ impl<'a, B: RBlob> Blob<'a, B> {
         item_size: NonZeroUsize,
         options: ReadOptions,
     ) -> Result<usize, Error> {
-        match self {
-            Self::Writer(writer) => Ok(writer
-                .read_many_into(buf, offsets, item_size, options)
-                .await?),
-            Self::Sealed(sealed) => Ok(sealed
-                .read_many_into(buf, offsets, item_size, options)
-                .await?),
-        }
+        let options = self.options | options;
+        Ok(match &self.source {
+            Source::Writer(writer) => {
+                writer
+                    .read_many_into(buf, offsets, item_size, options)
+                    .await?
+            }
+            Source::Sealed(sealed) => {
+                sealed
+                    .read_many_into(buf, offsets, item_size, options)
+                    .await?
+            }
+        })
     }
 
     /// Like [`Self::read_many_into`], but synchronous and cache-only. Returns the indices of
@@ -605,9 +663,9 @@ impl<'a, B: RBlob> Blob<'a, B> {
         offsets: &[u64],
         item_size: NonZeroUsize,
     ) -> Vec<usize> {
-        match self {
-            Self::Writer(writer) => writer.try_read_many_sync_into(buf, offsets, item_size),
-            Self::Sealed(sealed) => sealed.try_read_many_sync_into(buf, offsets, item_size),
+        match &self.source {
+            Source::Writer(writer) => writer.try_read_many_sync_into(buf, offsets, item_size),
+            Source::Sealed(sealed) => sealed.try_read_many_sync_into(buf, offsets, item_size),
         }
     }
 
@@ -617,9 +675,9 @@ impl<'a, B: RBlob> Blob<'a, B> {
         buf: &mut [u8],
         ranges: &[(u64, usize)],
     ) -> Vec<usize> {
-        match self {
-            Self::Writer(writer) => writer.try_read_ranges_sync_into(buf, ranges),
-            Self::Sealed(sealed) => sealed.try_read_ranges_sync_into(buf, ranges),
+        match &self.source {
+            Source::Writer(writer) => writer.try_read_ranges_sync_into(buf, ranges),
+            Source::Sealed(sealed) => sealed.try_read_ranges_sync_into(buf, ranges),
         }
     }
 }
@@ -853,16 +911,22 @@ impl<'a, B: RBlob> Blobs<'a, B> {
         self.oldest_blob_index + self.sealed.as_slice().len() as u64
     }
 
-    /// Resolve a blob, if retained.
+    /// Resolve a blob, if retained. Its reads apply the view's options.
     pub(super) fn get(&self, blob: u64) -> Option<Blob<'a, B>> {
-        if blob == self.tail_blob_index() {
-            return Some(self.tail.clone());
-        }
-        self.sealed
-            .as_slice()
-            .get(blob.checked_sub(self.oldest_blob_index)? as usize)
-            .cloned()
-            .map(Blob::Sealed)
+        let mut handle = if blob == self.tail_blob_index() {
+            self.tail.clone()
+        } else {
+            let index = blob.checked_sub(self.oldest_blob_index)? as usize;
+            Blob::sealed(self.sealed.as_slice().get(index)?.clone())
+        };
+        handle.options = self.options;
+        Some(handle)
+    }
+
+    /// A view whose reads apply `options`.
+    pub(super) fn with_options(mut self, options: ReadOptions) -> Self {
+        self.options = options;
+        self
     }
 }
 
@@ -940,7 +1004,7 @@ mod tests {
             let writer = Writer::new(blob, size, 128, cache).await.unwrap();
             let (writer, _) = writer.append(&encoded).await.unwrap();
             let (_, snapshot) = writer.snapshot().await.unwrap();
-            let source = Blob::Sealed(snapshot);
+            let source = Blob::sealed(snapshot);
             let mut replay = source
                 .replay_from(0, NZUsize!(128), ReadOptions::default())
                 .unwrap();
@@ -987,9 +1051,9 @@ mod tests {
             assert!(pending.try_snapshot().is_none());
 
             for (source, offset, paged) in [
-                (Blob::Writer(&pending), 40, false),
-                (Blob::Writer(&writer), 0, true),
-                (Blob::Sealed(snapshot), 0, true),
+                (Blob::writer(&pending), 40, false),
+                (Blob::writer(&writer), 0, true),
+                (Blob::sealed(snapshot), 0, true),
             ] {
                 let mut replay = source
                     .replay_from(offset, NZUsize!(12), ReadOptions::default())
@@ -1034,7 +1098,7 @@ mod tests {
             assert!(pending.try_snapshot().is_none());
 
             for (buffer_size, contiguous) in [(64, true), (4, false)] {
-                let mut replay = Blob::Writer(&pending)
+                let mut replay = Blob::writer(&pending)
                     .replay_from(64, NZUsize!(buffer_size), ReadOptions::default())
                     .unwrap();
                 assert!(replay.ensure(1).await.unwrap());
@@ -1086,9 +1150,9 @@ mod tests {
                 assert!(pending.try_snapshot().is_none());
 
                 for (source, offset) in [
-                    (Blob::Writer(&pending), 64),
-                    (Blob::Writer(&writer), 0),
-                    (Blob::Sealed(snapshot), 0),
+                    (Blob::writer(&pending), 64),
+                    (Blob::writer(&writer), 0),
+                    (Blob::sealed(snapshot), 0),
                 ] {
                     let mut replay = source
                         .clone()
@@ -1163,7 +1227,7 @@ mod tests {
             let (writer, _) = writer.append(b"abc").await.unwrap();
 
             let size = writer.size();
-            let tail = Blob::Writer(&writer);
+            let tail = Blob::writer(&writer);
             assert_insufficient_length(tail.read_up_to(size, 1, IoBufMut::with_capacity(1)).await);
             assert_eq!(
                 tail.read_up_to(size, 0, IoBufMut::with_capacity(0))
@@ -1174,7 +1238,7 @@ mod tests {
             );
 
             let (writer, snapshot) = writer.snapshot().await.unwrap();
-            let snapshot_blob = Blob::Sealed(snapshot);
+            let snapshot_blob = Blob::sealed(snapshot);
             assert_insufficient_length(
                 snapshot_blob
                     .read_up_to(size, 1, IoBufMut::with_capacity(1))
@@ -1191,7 +1255,7 @@ mod tests {
 
             let (sealed, sync) = writer.seal().await.unwrap();
             sync.await.unwrap();
-            let sealed_blob = Blob::Sealed(sealed);
+            let sealed_blob = Blob::sealed(sealed);
             assert_insufficient_length(
                 sealed_blob
                     .read_up_to(size, 1, IoBufMut::with_capacity(1))

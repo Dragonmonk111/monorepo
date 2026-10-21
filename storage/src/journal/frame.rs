@@ -9,7 +9,7 @@ use commonware_codec::{
     Buf, Decode, Encode, EncodeSize, OwnedBytes, ReadExt as _, Write,
     varint::{MAX_U32_VARINT_SIZE, UInt},
 };
-use commonware_runtime::{Blob, Buf as _, IoBufMut, IoBufs, buffer::paged::Writer};
+use commonware_runtime::{Blob, Buf as _, IoBufMut, IoBufs, ReadOptions, buffer::paged::Writer};
 use commonware_utils::{Cached, Widen};
 use std::{future::Future, io::Cursor};
 use zstd::{
@@ -45,13 +45,13 @@ impl<B: Blob, Phase: Send + Sync> FrameReader for Writer<B, Phase> {
         len: usize,
         buf: impl Into<IoBufMut> + Send,
     ) -> Result<(IoBufMut, usize), Error> {
-        Self::read_up_to(self, offset, len, buf)
+        Self::read_up_to(self, offset, len, buf, ReadOptions::default())
             .await
             .map_err(Error::Runtime)
     }
 
     async fn read_at(&self, offset: u64, len: usize) -> Result<IoBufs, Error> {
-        Self::read_at(self, offset, len)
+        Self::read_at(self, offset, len, ReadOptions::default())
             .await
             .map_err(Error::Runtime)
     }

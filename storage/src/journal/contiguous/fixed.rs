@@ -735,7 +735,10 @@ impl<E: Context, A: CodecFixedShared> Recovery<E, A> {
             .get(&blob)
             .expect("positions inside bounds map to a pending recovery blob");
         Ok(A::decode(
-            writer.read_at(offset, A::SIZE).await?.coalesce(),
+            writer
+                .read_at(offset, A::SIZE, ReadOptions::default())
+                .await?
+                .coalesce(),
         )?)
     }
 
@@ -1802,7 +1805,25 @@ pub struct Reader<'a, E: Context, A> {
     _phantom: PhantomData<A>,
 }
 
+impl<E: Context, A> Clone for Reader<'_, E, A> {
+    fn clone(&self) -> Self {
+        Self {
+            blobs: self.blobs.clone(),
+            bounds: self.bounds.clone(),
+            items_per_blob: self.items_per_blob,
+            metrics: self.metrics.clone(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
 impl<E: Context, A: CodecFixedShared> Reader<'_, E, A> {
+    /// A reader whose reads apply `options`.
+    pub(super) fn with_options(mut self, options: ReadOptions) -> Self {
+        self.blobs = self.blobs.with_options(options);
+        self
+    }
+
     /// Validate a position to be read: must lie within `bounds`.
     const fn validate_readable(&self, pos: u64) -> Result<(), Error> {
         if pos >= self.bounds.end {
@@ -4125,9 +4146,9 @@ mod tests {
             assert!(pending.try_snapshot().is_none());
 
             for source in [
-                super::super::blobs::Blob::Sealed(snapshot),
-                super::super::blobs::Blob::Writer(&writer),
-                super::super::blobs::Blob::Writer(&pending),
+                super::super::blobs::Blob::sealed(snapshot),
+                super::super::blobs::Blob::writer(&writer),
+                super::super::blobs::Blob::writer(&pending),
             ] {
                 let mut state = FixedReplayState::<_, View> {
                     replay: source

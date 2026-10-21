@@ -167,8 +167,14 @@ impl<B: Blob> View<'_, B> {
             == dst_start
     }
 
-    /// Reads bytes starting at `offset` into `buf`.
-    pub async fn read_into(&self, buf: &mut [u8], offset: u64) -> Result<(), Error> {
+    /// Reads bytes starting at `offset` into `buf`. Pages read from the blob enter the page
+    /// cache unless `options` contains [`ReadOptions::DONT_ADMIT`]; no other option applies.
+    pub async fn read_into(
+        &self,
+        buf: &mut [u8],
+        offset: u64,
+        options: ReadOptions,
+    ) -> Result<(), Error> {
         let end_offset = offset
             .checked_add(buf.len() as u64)
             .ok_or(Error::OffsetOverflow)?;
@@ -195,28 +201,36 @@ impl<B: Blob> View<'_, B> {
             return Ok(());
         }
 
-        let uncached_offset = offset + cached as u64;
-        let uncached_len = remaining - cached;
+        let missing_offset = offset + cached as u64;
+        let admit = !options.contains(ReadOptions::DONT_ADMIT);
         self.cache_ref
             .read_after_miss(
                 self.blob,
                 self.id,
-                &mut buf[cached..cached + uncached_len],
-                uncached_offset,
+                &mut buf[cached..remaining],
+                missing_offset,
+                admit,
             )
             .await
     }
 
-    /// Read exactly `len` immutable bytes starting at `offset`.
-    pub async fn read_at(&self, offset: u64, len: usize) -> Result<IoBufs, Error> {
+    /// Read exactly `len` immutable bytes starting at `offset` (see [`Self::read_into`] for
+    /// `options`).
+    pub async fn read_at(
+        &self,
+        offset: u64,
+        len: usize,
+        options: ReadOptions,
+    ) -> Result<IoBufs, Error> {
         let mut buf = IoBufMut::with_capacity(len);
         // SAFETY: read_into below initializes all `len` bytes.
         unsafe { buf.set_len(len) };
-        self.read_into(buf.as_mut(), offset).await?;
+        self.read_into(buf.as_mut(), offset, options).await?;
         Ok(buf.into())
     }
 
-    /// Reads up to `len` bytes starting at `offset`, but only as many as are available.
+    /// Reads up to `len` bytes starting at `offset`, but only as many as are available (see
+    /// [`Self::read_into`] for `options`).
     ///
     /// Returns the buffer (truncated to actual bytes read) and the number of bytes read. Returns an
     /// error if no bytes are available at the given offset.
@@ -225,6 +239,7 @@ impl<B: Blob> View<'_, B> {
         offset: u64,
         len: usize,
         bufs: impl Into<IoBufMut> + Send,
+        options: ReadOptions,
     ) -> Result<(IoBufMut, usize), Error> {
         let mut bufs = bufs.into();
         if len == 0 {
@@ -237,7 +252,7 @@ impl<B: Blob> View<'_, B> {
         }
         // SAFETY: read_into below fills all `available` bytes.
         unsafe { bufs.set_len(available) };
-        self.read_into(bufs.as_mut(), offset).await?;
+        self.read_into(bufs.as_mut(), offset, options).await?;
         Ok((bufs, available))
     }
 
@@ -488,7 +503,7 @@ mod tests {
             assert_eq!(batch, expected);
             assert_eq!(
                 writer
-                    .read_at(0, data.len())
+                    .read_at(0, data.len(), ReadOptions::default())
                     .await
                     .unwrap()
                     .coalesce()
@@ -507,7 +522,7 @@ mod tests {
             let writer = Writer::new(blob, size, page * 32, cache).await.unwrap();
             assert_eq!(
                 writer
-                    .read_at(0, data.len())
+                    .read_at(0, data.len(), ReadOptions::default())
                     .await
                     .unwrap()
                     .coalesce()
@@ -561,7 +576,10 @@ mod tests {
             writer = writer.sync().await.unwrap();
 
             // Warm the cache for the first page, then read across the page/tail boundary.
-            writer.read_at(0, page_size).await.unwrap();
+            writer
+                .read_at(0, page_size, ReadOptions::default())
+                .await
+                .unwrap();
             let mut buf = [0u8; 4];
             assert!(writer.try_read_sync_into(&mut buf, page_size as u64 - 2));
             assert_eq!(&buf, &[0xAA, 0xAA, b'T', b'A']);

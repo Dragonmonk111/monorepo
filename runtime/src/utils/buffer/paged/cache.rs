@@ -766,14 +766,22 @@ impl CacheRef {
 
     /// Complete the unread suffix of a cache probe. The first page is rechecked under the write
     /// lock before starting or joining a fetch. Subsequent cached pages are read together until
-    /// the next miss.
+    /// the next miss. Without `admit`, the suffix is served as a batched read without admission
+    /// instead (see [`Self::read_after_misses`]).
     pub(super) async fn read_after_miss<B: Blob>(
         &self,
         blob: &Arc<B>,
         blob_id: u64,
         mut buf: &mut [u8],
         mut offset: u64,
+        admit: bool,
     ) -> Result<(), Error> {
+        if !admit {
+            return self
+                .read_after_misses(blob, blob_id, vec![(buf, offset)], false)
+                .await;
+        }
+
         // Read from the page cache or `blob` until the requested data is fully read.
         // Fetch missing pages one at a time and copy consecutive cached pages together.
         while !buf.is_empty() {
@@ -1546,7 +1554,7 @@ mod tests {
                 // Read expects logical bytes only (CRCs are stripped).
                 let mut buf = vec![0; PAGE_SIZE.get() as usize];
                 cache_ref
-                    .read_after_miss(&blob, 0, &mut buf, i * PAGE_SIZE_U64)
+                    .read_after_miss(&blob, 0, &mut buf, i * PAGE_SIZE_U64, true)
                     .await
                     .unwrap();
                 assert_eq!(buf, [i as u8; PAGE_SIZE.get() as usize]);
@@ -1557,7 +1565,7 @@ mod tests {
             for i in 1..11 {
                 let mut buf = vec![0; PAGE_SIZE.get() as usize];
                 cache_ref
-                    .read_after_miss(&blob, 0, &mut buf, i * PAGE_SIZE_U64)
+                    .read_after_miss(&blob, 0, &mut buf, i * PAGE_SIZE_U64, true)
                     .await
                     .unwrap();
                 assert_eq!(buf, [i as u8; PAGE_SIZE.get() as usize]);
@@ -1615,6 +1623,7 @@ mod tests {
                         blob_id,
                         &mut buf,
                         0,
+                        true,
                     ));
 
                     // Publish the handoff only after the source's poll has returned, then park on
@@ -1643,7 +1652,7 @@ mod tests {
                     .spawn(move |_| async move {
                         let mut buf = vec![0; PAGE_SIZE.get() as usize];
                         second_cache
-                            .read_after_miss(&second_blob, blob_id, &mut buf, 0)
+                            .read_after_miss(&second_blob, blob_id, &mut buf, 0, true)
                             .await
                             .unwrap();
                         buf
@@ -1741,7 +1750,7 @@ mod tests {
 
             let mut buf = vec![0u8; page.len()];
             cache_ref
-                .read_after_miss(&blob, 0, &mut buf, 0)
+                .read_after_miss(&blob, 0, &mut buf, 0, true)
                 .await
                 .unwrap();
             assert_eq!(buf, page);
@@ -1749,7 +1758,7 @@ mod tests {
 
             let mut buf = vec![0u8; page.len()];
             cache_ref
-                .read_after_miss(&blob, 0, &mut buf, 0)
+                .read_after_miss(&blob, 0, &mut buf, 0, true)
                 .await
                 .unwrap();
             assert_eq!(buf, page);
@@ -1759,7 +1768,7 @@ mod tests {
 
             let mut buf = vec![0u8; page.len()];
             cache_ref
-                .read_after_miss(&blob, 0, &mut buf, 0)
+                .read_after_miss(&blob, 0, &mut buf, 0, true)
                 .await
                 .unwrap();
             assert_eq!(buf, page);
@@ -1827,7 +1836,7 @@ mod tests {
             // range inside page 0, one straddling pages 3-4, and one ending in page 6.
             let mut buf = vec![0u8; page];
             cache_ref
-                .read_after_miss(&blob, 0, &mut buf, 2 * PAGE_SIZE_U64)
+                .read_after_miss(&blob, 0, &mut buf, 2 * PAGE_SIZE_U64, true)
                 .await
                 .unwrap();
             recordings.clear();
@@ -1860,7 +1869,7 @@ mod tests {
             for (offset, len) in ranges {
                 let mut buf = vec![0u8; len];
                 cache_ref
-                    .read_after_miss(&blob, 0, &mut buf, offset)
+                    .read_after_miss(&blob, 0, &mut buf, offset, true)
                     .await
                     .unwrap();
             }
@@ -1942,7 +1951,7 @@ mod tests {
             for page in 20..40 {
                 let mut buf = [0u8; 1];
                 cache_ref
-                    .read_after_miss(&blob, 0, &mut buf, page * PAGE_SIZE_U64)
+                    .read_after_miss(&blob, 0, &mut buf, page * PAGE_SIZE_U64, true)
                     .await
                     .unwrap();
             }
@@ -1983,7 +1992,7 @@ mod tests {
             let cache_ref = CacheRef::new(PAGE_SIZE, NZUsize!(2));
             let mut buf = [0u8; 1];
             cache_ref
-                .read_after_miss(&blob, 0, &mut buf, PAGE_SIZE_U64)
+                .read_after_miss(&blob, 0, &mut buf, PAGE_SIZE_U64, true)
                 .await
                 .unwrap();
             recordings.clear();
@@ -2285,7 +2294,7 @@ mod tests {
     ) -> Result<u8, Error> {
         let mut buf = [0u8; 1];
         cache_ref
-            .read_after_miss(blob, 0, &mut buf, page * PAGE_SIZE_U64)
+            .read_after_miss(blob, 0, &mut buf, page * PAGE_SIZE_U64, true)
             .await?;
         Ok(buf[0])
     }
@@ -3584,7 +3593,7 @@ mod tests {
             let blob_for_task = blob.clone();
             let handle = context.spawn(move |_| async move {
                 let _ = cache_ref_for_task
-                    .read_after_miss(&blob_for_task, blob_id, &mut read_buf, 0)
+                    .read_after_miss(&blob_for_task, blob_id, &mut read_buf, 0, true)
                     .await;
             });
 
@@ -3636,7 +3645,7 @@ mod tests {
             let blob_for_first = blob.clone();
             let first = context.child("first").spawn(move |_| async move {
                 let _ = cache_ref_for_first
-                    .read_after_miss(&blob_for_first, blob_id, &mut first_buf, 0)
+                    .read_after_miss(&blob_for_first, blob_id, &mut first_buf, 0, true)
                     .await;
             });
             started_rx.await.expect("first read never started");
@@ -3647,7 +3656,7 @@ mod tests {
             let blob_for_second = blob.clone();
             let second = context.child("second").spawn(move |_| async move {
                 cache_ref_for_second
-                    .read_after_miss(&blob_for_second, blob_id, &mut second_buf, 0)
+                    .read_after_miss(&blob_for_second, blob_id, &mut second_buf, 0, true)
                     .await
                     .expect("second read failed");
                 second_buf
@@ -3680,7 +3689,7 @@ mod tests {
             let blob_for_third = blob.clone();
             let third = context.child("third").spawn(move |_| async move {
                 cache_ref_for_third
-                    .read_after_miss(&blob_for_third, blob_id, &mut third_buf, 0)
+                    .read_after_miss(&blob_for_third, blob_id, &mut third_buf, 0, true)
                     .await
                     .expect("third read failed");
                 third_buf
@@ -3725,7 +3734,7 @@ mod tests {
             // A later read should hit the cached page and avoid touching the blob again.
             let mut fourth_buf = vec![0u8; PAGE_SIZE.get() as usize];
             cache_ref
-                .read_after_miss(&blob, blob_id, &mut fourth_buf, 0)
+                .read_after_miss(&blob, blob_id, &mut fourth_buf, 0, true)
                 .await
                 .unwrap();
             assert_eq!(fourth_buf, logical_page);
@@ -3763,7 +3772,7 @@ mod tests {
             let blob_for_first = blob.clone();
             let first = context.child("first").spawn(move |_| async move {
                 cache_ref_for_first
-                    .read_after_miss(&blob_for_first, blob_id, &mut first_buf, 0)
+                    .read_after_miss(&blob_for_first, blob_id, &mut first_buf, 0, true)
                     .await
             });
             started_rx.await.expect("first erroring read never started");
@@ -3774,7 +3783,7 @@ mod tests {
             let blob_for_second = blob.clone();
             let second = context.child("second").spawn(move |_| async move {
                 cache_ref_for_second
-                    .read_after_miss(&blob_for_second, blob_id, &mut second_buf, 0)
+                    .read_after_miss(&blob_for_second, blob_id, &mut second_buf, 0, true)
                     .await
             });
 
@@ -3817,7 +3826,7 @@ mod tests {
             let mut third_buf = vec![0u8; PAGE_SIZE.get() as usize];
             assert!(matches!(
                 cache_ref
-                    .read_after_miss(&blob, blob_id, &mut third_buf, 0)
+                    .read_after_miss(&blob, blob_id, &mut third_buf, 0, true)
                     .await,
                 Err(Error::ReadFailed)
             ));
@@ -3843,11 +3852,13 @@ mod tests {
 
             // Keep the follower suspended while another waiter completes the failed fetch.
             let mut first_buf = vec![0; PAGE_SIZE.get() as usize];
-            let mut first = Box::pin(cache_ref.read_after_miss(&blob, blob_id, &mut first_buf, 0));
+            let mut first =
+                Box::pin(cache_ref.read_after_miss(&blob, blob_id, &mut first_buf, 0, true));
             assert!(poll!(&mut first).is_pending());
             started_rx.await.unwrap();
             let mut stale_buf = vec![0; PAGE_SIZE.get() as usize];
-            let mut stale = Box::pin(cache_ref.read_after_miss(&blob, blob_id, &mut stale_buf, 0));
+            let mut stale =
+                Box::pin(cache_ref.read_after_miss(&blob, blob_id, &mut stale_buf, 0, true));
             assert!(poll!(&mut stale).is_pending());
             assert_eq!(reads.load(Ordering::Relaxed), 1);
             release_tx.send(()).unwrap();
@@ -3859,7 +3870,8 @@ mod tests {
             *blob.started.lock() = Some(started_tx);
             *blob.release.lock() = Some(release_rx);
             let mut retry_buf = vec![0; PAGE_SIZE.get() as usize];
-            let mut retry = Box::pin(cache_ref.read_after_miss(&blob, blob_id, &mut retry_buf, 0));
+            let mut retry =
+                Box::pin(cache_ref.read_after_miss(&blob, blob_id, &mut retry_buf, 0, true));
             assert!(poll!(&mut retry).is_pending());
             started_rx.await.unwrap();
             assert_eq!(reads.load(Ordering::Relaxed), 2);
@@ -3868,7 +3880,7 @@ mod tests {
             drop(stale);
             let mut joined_buf = vec![0; PAGE_SIZE.get() as usize];
             let mut joined =
-                Box::pin(cache_ref.read_after_miss(&blob, blob_id, &mut joined_buf, 0));
+                Box::pin(cache_ref.read_after_miss(&blob, blob_id, &mut joined_buf, 0, true));
             assert!(poll!(&mut joined).is_pending());
             assert_eq!(reads.load(Ordering::Relaxed), 2);
             release_tx.send(()).unwrap();
@@ -3938,7 +3950,7 @@ mod tests {
             });
             for (remaining, offset) in ranges {
                 cache_ref
-                    .read_after_miss(&blob, blob_id, remaining, offset)
+                    .read_after_miss(&blob, blob_id, remaining, offset, true)
                     .await
                     .unwrap();
             }
@@ -3966,7 +3978,7 @@ mod tests {
             });
 
             // Another reader may populate the page before the completion future is polled.
-            let completion = cache_ref.read_after_miss(&blob, blob_id, &mut buf, 3);
+            let completion = cache_ref.read_after_miss(&blob, blob_id, &mut buf, 3, true);
             cache_ref.cache(blob_id, &vec![0x44; PAGE_SIZE.get() as usize], 0);
             completion.await.unwrap();
             assert_eq!(reads.load(Ordering::Relaxed), 0);

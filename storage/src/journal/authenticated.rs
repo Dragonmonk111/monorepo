@@ -437,7 +437,9 @@ where
     /// `historical_leaves` leaves.
     ///
     /// Returns a proof and the items corresponding to the leaves in the range `start_loc..end_loc`,
-    /// where `end_loc` is the minimum of `historical_leaves` and `start_loc + max_ops`.
+    /// where `end_loc` is the minimum of `historical_leaves` and `start_loc + max_ops`. The items
+    /// are read without admitting their pages to the page cache, so serving proofs does not
+    /// displace data the journal's other readers need.
     ///
     /// # Errors
     ///
@@ -477,7 +479,7 @@ where
         let positions: Vec<u64> = (*start_loc..*end_loc).collect();
         let ops = self
             .journal
-            .read_many(&positions, ReadOptions::default())
+            .read_many(&positions, ReadOptions::DONT_ADMIT)
             .await?;
 
         Ok((proof, ops))

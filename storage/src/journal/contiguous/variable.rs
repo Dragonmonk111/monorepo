@@ -476,6 +476,29 @@ pub struct Reader<'a, E: Context, V: Codec> {
     metrics: Arc<Metrics<E>>,
 }
 
+impl<E: Context, V: Codec> Clone for Reader<'_, E, V> {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            bounds: self.bounds.clone(),
+            offsets: self.offsets.clone(),
+            items_per_blob: self.items_per_blob,
+            codec_config: self.codec_config.clone(),
+            compressed: self.compressed,
+            metrics: self.metrics.clone(),
+        }
+    }
+}
+
+impl<E: Context, V: Codec> Reader<'_, E, V> {
+    /// A reader whose reads of both data and offsets apply `options`.
+    fn with_options(mut self, options: ReadOptions) -> Self {
+        self.data = self.data.with_options(options);
+        self.offsets = self.offsets.with_options(options);
+        self
+    }
+}
+
 impl<'a, E: Context, V: CodecShared> Reader<'a, E, V> {
     /// Validate a position to be read: must lie within `bounds`.
     const fn validate_readable(&self, position: u64) -> Result<(), Error> {
@@ -912,7 +935,6 @@ async fn complete<E: Context, V: CodecShared>(
     reader: &Reader<'_, E, V>,
     items: Vec<Option<V>>,
     misses: Vec<Miss>,
-    options: ReadOptions,
 ) -> Result<Vec<V>, Error> {
     if misses.is_empty() {
         return Ok(items
@@ -921,7 +943,7 @@ async fn complete<E: Context, V: CodecShared>(
             .collect());
     }
 
-    let fetched = reader.fetch_misses(&misses, options).await?;
+    let fetched = reader.fetch_misses(&misses).await?;
     let mut fetched = fetched.into_iter();
     Ok(items
         .into_iter()
@@ -949,9 +971,8 @@ impl<E: Context, V: CodecShared> Reader<'_, E, V> {
     /// Complete probe misses (strictly increasing by position): resolve outstanding offsets
     /// without the offsets journal's cache pass (those positions just missed it) and read the
     /// frames with one batched pass per blob run. Returns one item per miss, in order.
-    /// Read `misses`, resolving unresolved frame offsets through the offsets journal with
-    /// `options`.
-    async fn fetch_misses(&self, misses: &[Miss], options: ReadOptions) -> Result<Vec<V>, Error> {
+    /// Read `misses`, resolving unresolved frame offsets through the offsets journal.
+    async fn fetch_misses(&self, misses: &[Miss]) -> Result<Vec<V>, Error> {
         if misses.is_empty() {
             return Ok(Vec::new());
         }
@@ -972,7 +993,7 @@ impl<E: Context, V: CodecShared> Reader<'_, E, V> {
         // validated against `bounds`, so the offsets journal must have them.
         let fetched = self
             .offsets
-            .read_many_inner(&unresolved, options)
+            .read_many_inner(&unresolved, ReadOptions::default())
             .await
             .map_err(|e| match e {
                 Error::ItemOutOfRange(e) | Error::ItemPruned(e) => {
@@ -1051,7 +1072,12 @@ impl<E: Context, V: CodecShared> super::Contiguous for Reader<'_, E, V> {
         self.metrics.read_many_calls.inc();
         self.validate_read_many(positions)?;
         let (items, misses) = self.probe_parts(positions);
-        complete(self, items, misses, options).await
+        if options == ReadOptions::default() {
+            return complete(self, items, misses).await;
+        }
+
+        // The misses' data and offsets reads carry the options.
+        complete(&self.clone().with_options(options), items, misses).await
     }
 
     fn try_read_sync(&self, position: u64) -> Option<V> {
@@ -3853,6 +3879,85 @@ mod tests {
     }
 
     #[test_traced]
+    fn test_variable_read_many_without_admission_does_not_cache() {
+        // Batched reads without admission, through the journal and through a snapshot reader,
+        // return the items without caching their data or offsets pages. Admitting reads cache
+        // them.
+        type TestJournal = Journal<deterministic::Context, FixedBytes<300>>;
+        fn data_cached(journal: &TestJournal) -> bool {
+            let mut probe = [0u8; 1];
+            let blobs = journal.0.blobs.reader();
+            blobs.get(0).unwrap().try_read_sync_into(&mut probe, 0)
+        }
+        fn offsets_cached(journal: &TestJournal, positions: &[u64]) -> bool {
+            let offsets = journal.0.offsets.reader();
+            positions
+                .iter()
+                .all(|&p| offsets.try_read_sync(p).is_some())
+        }
+
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            // Thirty items per section give the first offsets blob two full (cacheable) pages
+            // holding positions 0 through 24, ahead of a partial page kept in memory.
+            let cache = CacheRef::new(PAGE_SIZE, NZUsize!(256));
+            let cfg = Config {
+                partition: "read-many-no-admit".into(),
+                items_per_section: NZU64!(30),
+                compression: None,
+                codec_config: (),
+                page_cache: cache.clone(),
+                write_buffer: NZUsize!(1024),
+                replay_buffer: NZUsize!(1024),
+            };
+            let items = (0..65)
+                .map(|i| FixedBytes::new([i as u8; 300]))
+                .collect::<Vec<_>>();
+            let mut journal = TestJournal::init(context.child("j"), cfg).await.unwrap();
+            (journal, _) = journal.append_many(Many::Flat(&items)).await.unwrap();
+            journal = journal.sync().await.unwrap();
+
+            // Drop every cached page.
+            let paged: Vec<u64> = (0..25).collect();
+            cache.clear();
+            assert!(!data_cached(&journal));
+            assert!(!offsets_cached(&journal, &paged));
+
+            let first: Vec<u64> = (0..30).collect();
+            assert_eq!(
+                journal
+                    .read_many(&first, ReadOptions::DONT_ADMIT)
+                    .await
+                    .unwrap(),
+                items[..30]
+            );
+            let (journal, snapshot) = journal.snapshot().await.unwrap();
+            assert_eq!(
+                snapshot
+                    .read_many(&first, ReadOptions::DONT_ADMIT)
+                    .await
+                    .unwrap(),
+                items[..30]
+            );
+            assert!(!data_cached(&journal));
+            assert!(!offsets_cached(&journal, &paged));
+
+            assert_eq!(
+                journal
+                    .read_many(&first, ReadOptions::default())
+                    .await
+                    .unwrap(),
+                items[..30]
+            );
+            assert!(data_cached(&journal));
+            assert!(offsets_cached(&journal, &paged));
+
+            drop(snapshot);
+            journal.destroy().await.unwrap();
+        });
+    }
+
+    #[test_traced]
     fn test_replay_read_options_reach_history_and_tip() {
         const PAGE_SIZE: NonZeroU16 = NZU16!(40);
 
@@ -5657,7 +5762,7 @@ mod tests {
                     let blob = blob_index as u64;
                     states.push(ReplayState::<_, u64> {
                         blob,
-                        replay: Blob::Writer(writer)
+                        replay: Blob::writer(writer)
                             .replay_from(0, NZUsize!(1024), ReadOptions::default())
                             .unwrap(),
                         budget: 1024,
